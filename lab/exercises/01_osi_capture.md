@@ -149,13 +149,13 @@ capture** (champ, valeur observée). Justifiez en 1-2 phrases.
 
 | Couche OSI         | Élément observé dans la capture | Valeur exemple |
 | ------------------ | ------------------------------- | -------------- |
-| 7 — Application    | _ex. méthode HTTP_              | `GET /whoami HTTP/1.1` |
-| 6 — Présentation   | _ex. encodage / Content-Type_   | …              |
-| 5 — Session        | _ex. Keep-Alive, cookies_       | …              |
-| 4 — Transport      | _ex. port TCP, flags_           | …              |
-| 3 — Réseau         | _ex. IP source / destination_   | …              |
-| 2 — Liaison        | _ex. adresses MAC_              | …              |
-| 1 — Physique       | _non visible — pourquoi&nbsp;?_ | …              |
+| 7 — Application    | _ex. méthode HTTP_              | `GET /whoami HTTP/1.1` |C'est la couche que l'application "comprend". La méthode GET indique l'action voulue, l'URI désigne la ressource, le Host permet le virtual hosting
+| 6 — Présentation   | _ex. encodage / Content-Type_   | …   text/html (encodage du payload)    L6 s'occupe du format des données : comment interpréter les bytes       |
+| 5 — Session        | _ex. Keep-Alive, cookies_       | …   keep-alive (réutilise la connexion)     L5 gère le maintien d'un dialogue continu entre client et serveur.      |
+| 4 — Transport      | _ex. port TCP, flags_           | …  40844 → 80, flags AP (ACK+PUSH)  L4 multiplexe plusieurs services sur une même IP via les ports (80=HTTP, 443=HTTPS, 22=SSH).          |
+| 3 — Réseau         | _ex. IP source / destination_   | …  172.20.1.50 → 172.20.0.10            L3 est end-to-end : ces IPs traversent tous les routeurs jusqu'à la destination. Le TTL=64 est décrémenté à chaque saut   |
+| 2 — Liaison        | _ex. adresses MAC_              | …   e2:08:b8:3b:49:30 → 92:fa:d9:67:0b:21 L2 est point-à-point sur le segment LAN. La MAC destination est celle du prochain saut  |           |
+| 1 — Physique       | _non visible — pourquoi&nbsp;?_ | … tcpdump capture à partir de L2    L1 = signaux électriques/optiques/radio           |
 
 ## Questions de réflexion
 
@@ -165,7 +165,14 @@ vous apprend cette observation sur la portée de chaque couche&nbsp;?
 
 > 💬 **Votre réponse :**
 >
-> _Remplacez ce texte par votre réponse._
+> La MAC destination observée (92:fa:d9:67:0b:21) est celle du **nat-router**, et non
+celle du serveur `lab_internet`. C'est normal : les adresses MAC ont une **portée
+strictement locale** au segment L2 (un seul lien).
+
+Le client (172.20.1.50) et le serveur (172.20.0.10) sont sur **deux réseaux IP
+différents** (172.20.1.0/24 et 172.20.0.0/24). Le client ne peut pas joindre le
+serveur directement en L2 — il doit passer par sa passerelle (nat-router).
+
 
 **Question 2.** Vous capturez sur `eth0` du client (côté LAN). Dans votre
 trace, l'**IP source** sortante est `172.20.1.50`. Pourtant, `curl /whoami`
@@ -175,7 +182,22 @@ et indiquez **où** il faudrait capturer pour voir l'IP réécrite.
 
 > 💬 **Votre réponse :**
 >
-> _Remplacez ce texte par votre réponse._
+> La capture se fait sur `eth0` du **client**, donc **avant** que le paquet ne
+traverse le nat-router. À ce moment, l'IP source est encore celle d'origine :
+172.20.1.50.
+
+Le nat-router applique ensuite une règle iptables **MASQUERADE** : il **réécrit**
+l'IP source en 172.20.0.254 (son IP côté réseau `lab_internet`) et mémorise la
+traduction dans sa table conntrack. C'est pour cela que le serveur perçoit
+172.20.0.254.
+
+Pour voir l'IP **réécrite**, il faut capturer **sur le nat-router** (interface
+côté réseau internet) ou **directement sur le serveur** :
+
+    docker exec lab_nat_router tcpdump -i any -nn -c 10 host 172.20.0.10
+
+Cela illustre que le NAT modifie la couche 3 (IP source) mais sans toucher au
+contenu applicatif (couche 7).
 
 **Question 3.** Lancez `curl -v https://...` vers un site HTTPS public
 (depuis l'hôte, pas le lab). Quelle couche change visiblement par
@@ -184,7 +206,25 @@ visibilité&nbsp;?
 
 > 💬 **Votre réponse :**
 >
-> _Remplacez ce texte par votre réponse._
+> En lançant `curl -v https://www.google.com`, on observe les changements suivants
+dans la capture par rapport au HTTP du lab :
+
+**Ce qui change visiblement :**
+- Un **TLS handshake** s'intercale entre la connexion TCP et la requête HTTP
+  (ClientHello, ServerHello, échange de certificats, dérivation de clés).
+- La **couche 6 (Présentation)** devient active et chiffre tout ce qui est
+  au-dessus (HTTP).
+
+**Ce qui disparaît de la visibilité :**
+- **L7 (HTTP)** : méthode, URI, headers, body — tout est chiffré.
+- **L6 applicative** (Content-Type, encodage) — chiffré.
+- **L5** (Connection, cookies) — chiffré.
+
+**Ce qui reste visible :**
+- L2 (MAC), L3 (IP source/dest), L4 (ports TCP, flags).
+
+C'est ce qui permet aux firewalls et aux routeurs de fonctionner même en HTTPS :
+ils n'ont besoin que des couches basses pour acheminer.
 
 **Question 4.** La couche 5 (Session) est très peu visible dans une
 capture HTTP/1.1. Donnez **deux mécanismes applicatifs** qui jouent le
@@ -193,7 +233,27 @@ rôle de la couche session, et expliquez pourquoi ils sont implémentés
 
 > 💬 **Votre réponse :**
 >
-> _Remplacez ce texte par votre réponse._
+> En HTTP/1.1, la couche 5 (Session) est très peu visible parce qu'HTTP est
+**stateless** par design — chaque requête est indépendante. La notion de session
+est donc déléguée à l'applicatif. Deux mécanismes courants :
+
+1. **Cookies HTTP** (`Set-Cookie` / `Cookie`) : le serveur émet un identifiant
+   de session qu'il stocke côté serveur. Le client le renvoie à chaque requête.
+
+2. **Tokens (JWT, OAuth)** : un jeton signé contient l'état de session
+   (utilisateur, droits, expiration). Le client l'envoie en header
+   `Authorization: Bearer ...`.
+
+**Pourquoi "plus haut" dans la pile ?**
+
+- La **couche 5 OSI** a été largement abandonnée en pratique. TCP (couche 4)
+  gère déjà la session bas-niveau (handshake, FIN, numéros de séquence).
+- Les besoins de session **applicative** (qui est connecté ? quels droits ?
+  panier d'achat ?) sont **spécifiques à chaque application** — ils ne
+  rentreraient pas dans un protocole générique de couche 5.
+- Implémenter au niveau application permet de **traverser les proxies,
+  load-balancers, CDN** sans casser la session (un cookie suit le HTTP, peu
+  importe combien de TCP différents servent les requêtes).
 
 ## Pièges fréquents
 
